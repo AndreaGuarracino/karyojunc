@@ -1,0 +1,13 @@
+[package]
+name = "karyojunc"
+version = "0.1.0"
+edition = "2024"
+description = "Band junctions and band k-mer counts from KaryoScope annotations"
+license = "MIT"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+
+[profile.release]
+lto = true
+codegen-units = 1

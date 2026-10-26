@@ -51,28 +51,45 @@ fn num(x: &[u8]) -> Option<u64> {
     d.iter().try_fold(0u64, |n, &c| if c.is_ascii_digit() { n.checked_mul(10)?.checked_add((c - b'0') as u64) } else { None })
 }
 
-// plain text, gzip through bgzip, or '-' for stdin
+// plain text, gzip (also BGZF), or '-' for stdin
 fn open(p: &str) -> Box<dyn BufRead> {
     if p == "-" { return Box::new(BufReader::with_capacity(1 << 22, std::io::stdin())); }
-    let mut f = std::fs::File::open(p).unwrap_or_else(|e| panic!("{p}: {e}"));
-    let mut m = [0u8; 2];
-    let gz = f.read(&mut m).unwrap_or(0) == 2 && m == [0x1f, 0x8b];
-    if !gz { return Box::new(BufReader::with_capacity(1 << 22, std::fs::File::open(p).unwrap())); }
-    let mut c = std::process::Command::new("bgzip").args(["-dc", "-@", "4", p]).stdout(std::process::Stdio::piped()).spawn()
-        .unwrap_or_else(|e| panic!("bgzip {p}: {e}"));
-    let out = c.stdout.take().unwrap();
-    Box::new(BufReader::with_capacity(1 << 22, Gz(c, out)))
+    let mut f = BufReader::with_capacity(1 << 22, std::fs::File::open(p).unwrap_or_else(|e| panic!("{p}: {e}")));
+    if f.fill_buf().unwrap_or_else(|e| panic!("{p}: {e}")).starts_with(&[0x1f, 0x8b]) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        std::thread::spawn(move || {
+            let mut d = flate2::bufread::MultiGzDecoder::new(f);
+            loop {
+                let (mut b, mut n) = (vec![0u8; 1 << 20], 0);
+                while n < b.len() {
+                    match d.read(&mut b[n..]) { Ok(0) => break, Ok(k) => n += k, Err(e) => { let _ = tx.send(Err(e)); return; } }
+                }
+                b.truncate(n);
+                if n == 0 || tx.send(Ok(b)).is_err() { return; }
+            }
+        });
+        return Box::new(Pipe { rx, buf: vec![], pos: 0 });
+    }
+    Box::new(f)
 }
 
-// bgzip output; a failed bgzip is an error at end of stream
-struct Gz(std::process::Child, std::process::ChildStdout);
-impl std::io::Read for Gz {
-    fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.1.read(b)?;
-        if n == 0 && !b.is_empty() {
-            let s = self.0.wait()?;
-            if !s.success() { return Err(std::io::Error::other(format!("bgzip {s}"))); }
+// gzip decoded in its own thread, in 1 MB blocks
+struct Pipe { rx: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>, buf: Vec<u8>, pos: usize }
+impl BufRead for Pipe {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        if self.pos == self.buf.len() {
+            match self.rx.recv() { Ok(b) => { self.buf = b?; self.pos = 0; } Err(_) => return Ok(&[]) }
         }
+        Ok(&self.buf[self.pos..])
+    }
+    fn consume(&mut self, n: usize) { self.pos += n; }
+}
+impl Read for Pipe {
+    fn read(&mut self, o: &mut [u8]) -> std::io::Result<usize> {
+        let b = self.fill_buf()?;
+        let n = b.len().min(o.len());
+        o[..n].copy_from_slice(&b[..n]);
+        self.consume(n);
         Ok(n)
     }
 }
